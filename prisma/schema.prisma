@@ -1,0 +1,240 @@
+// Pulse Analytics — database schema
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Used by migrations when DATABASE_URL points at a pooler (Neon/Supabase).
+  directUrl = env("DIRECT_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Identity (shape required by @auth/prisma-adapter)
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  /// bcrypt hash. Null for OAuth-only accounts.
+  passwordHash  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts           Account[]
+  sessions           Session[]
+  memberships        OrganizationMember[]
+  invitationsSent    Invitation[]         @relation("InvitedBy")
+  apiKeysCreated     ApiKey[]             @relation("ApiKeyCreatedBy")
+
+  @@map("users")
+}
+
+model Account {
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+/// Only used if the session strategy is switched to "database". JWT is the default.
+model Session {
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// Email verification tokens. `token` stores a SHA-256 hash, never the raw token.
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@id([identifier, token])
+  @@map("verification_tokens")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Multi-tenancy
+// ─────────────────────────────────────────────────────────────
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model Organization {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members     OrganizationMember[]
+  invitations Invitation[]
+  projects    Project[]
+
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  role           Role     @default(MEMBER)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@map("organization_members")
+}
+
+model Invitation {
+  id             String    @id @default(cuid())
+  organizationId String
+  email          String
+  role           Role      @default(MEMBER)
+  /// SHA-256 of the token sent by email.
+  tokenHash      String    @unique
+  invitedById    String?
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  revokedAt      DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  invitedBy    User?        @relation("InvitedBy", fields: [invitedById], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, createdAt])
+  @@index([email])
+  @@map("invitations")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Projects & API keys
+// ─────────────────────────────────────────────────────────────
+
+model Project {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  description    String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  apiKeys      ApiKey[]
+  events       Event[]
+  users        ProjectUser[]
+
+  @@index([organizationId, createdAt])
+  @@map("projects")
+}
+
+/// Each key has a public id (`pk_…`, safe to embed in browsers, ingestion only)
+/// and a secret (`sk_…`, shown once, stored as a SHA-256 hash).
+model ApiKey {
+  id            String    @id @default(cuid())
+  projectId     String
+  name          String
+  /// Public key, e.g. `pk_live_…`. Unique lookup for ingestion.
+  publicKey     String    @unique
+  /// SHA-256 hex of the secret key. Raw secret is never stored.
+  secretHash    String    @unique
+  /// First characters of the secret for display (`sk_live_ab12…`).
+  secretPrefix  String
+  createdById   String?
+  lastUsedAt    DateTime?
+  requestCount  BigInt    @default(0)
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  createdBy User?   @relation("ApiKeyCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([projectId, createdAt])
+  @@map("api_keys")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Analytics data (high write volume)
+// ─────────────────────────────────────────────────────────────
+
+/// Append-only event log.
+///
+/// - The primary key includes `timestamp` so the table can later be converted to
+///   native range partitioning (PARTITION BY RANGE (timestamp)) without changing
+///   the key — Postgres requires the partition key in every unique constraint.
+/// - No secondary unique constraints, minimal indexes, to keep inserts cheap.
+model Event {
+  id         String   @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  projectId  String
+  name       String   @db.VarChar(200)
+  distinctId String   @db.VarChar(200)
+  timestamp  DateTime @db.Timestamptz(3)
+  receivedAt DateTime @default(now()) @db.Timestamptz(3)
+  properties Json     @default("{}") @db.JsonB
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@id([id, timestamp])
+  // Time-range scans for a project (overview, charts, explorer).
+  @@index([projectId, timestamp(sort: Desc)])
+  // Filter / group by event name within a time range.
+  @@index([projectId, name, timestamp])
+  // Per-user lookups and distinct counts.
+  @@index([projectId, distinctId, timestamp])
+  // Property containment filters: properties @> '{"plan":"pro"}'.
+  @@index([properties(ops: JsonbPathOps)], type: Gin)
+  @@map("events")
+}
+
+/// One row per (project, distinctId), maintained on ingest via upsert.
+/// Makes "total users" and "user growth" O(users) instead of O(events).
+model ProjectUser {
+  projectId   String
+  distinctId  String   @db.VarChar(200)
+  firstSeenAt DateTime @db.Timestamptz(3)
+  lastSeenAt  DateTime @db.Timestamptz(3)
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, distinctId])
+  @@index([projectId, firstSeenAt])
+  @@index([projectId, lastSeenAt])
+  @@map("project_users")
+}
