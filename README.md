@@ -4,6 +4,9 @@ A lightweight, multi-tenant product analytics platform (think a small PostHog / 
 Create organizations and projects, send events over a simple HTTP API, and explore them in real-time
 and historical dashboards — with team roles, API key management and secure defaults.
 
+**🔗 Live demo:** https://pulse-analytics-self.vercel.app — sign in with `demo@pulse.dev` / `demo1234`
+(or `admin@`, `member@`, `viewer@pulse.dev` to see each role).
+
 **Stack:** Next.js 15 (App Router) · TypeScript · Tailwind CSS v4 · shadcn/ui · Lucide · PostgreSQL · Prisma 6 ·
 Auth.js v5 (Credentials + Google) · Recharts · Zod · Vitest · Upstash Redis (optional)
 
